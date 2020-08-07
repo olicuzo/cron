@@ -11,19 +11,19 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries   []*Entry
-	chain     Chain
-	stop      chan struct{}
-	add       chan *Entry
-	remove    chan EntryID
-	snapshot  chan chan []Entry
-	running   bool
-	logger    Logger
-	runningMu sync.Mutex
-	location  *time.Location
-	parser    ScheduleParser
-	nextID    EntryID
-	jobWaiter sync.WaitGroup
+	entries    []*Entry
+	chain      Chain
+	stop       chan struct{}
+	add        chan *Entry
+	remove     chan EntryID
+	snapshot   chan chan []Entry
+	running    bool
+	logger     Logger
+	runningMu  sync.Mutex
+	location   *time.Location
+	parser     ScheduleParser
+	internalID int
+	jobWaiter  sync.WaitGroup
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -44,7 +44,10 @@ type Schedule interface {
 }
 
 // EntryID identifies an entry within a Cron instance
-type EntryID int
+type EntryID struct {
+	ID   int
+	Name string
+}
 
 // Entry consists of a schedule and the func to execute on that schedule.
 type Entry struct {
@@ -72,7 +75,7 @@ type Entry struct {
 }
 
 // Valid returns true if this is not the zero entry.
-func (e Entry) Valid() bool { return e.ID != 0 }
+func (e Entry) Valid() bool { return e.ID.ID != 0 }
 
 // byTime is a wrapper for sorting the entry array by time
 // (with zero time at the end).
@@ -135,6 +138,11 @@ type FuncJob func()
 
 func (f FuncJob) Run() { f() }
 
+func (c *Cron) NextID(jobName string) EntryID {
+	c.internalID += 1
+	return EntryID{ID: c.internalID, Name: jobName}
+}
+
 // AddFunc adds a func to the Cron to be run on the given schedule.
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
@@ -146,21 +154,37 @@ func (c *Cron) AddFunc(spec string, cmd func()) (EntryID, error) {
 // The spec is parsed using the time zone of this Cron instance as the default.
 // An opaque ID is returned that can be used to later remove it.
 func (c *Cron) AddJob(spec string, cmd Job) (EntryID, error) {
+	return c.AddJobWithName(spec, "", cmd)
+}
+
+// AddJobWithName adds a Job to the Cron to be run on the given schedule.
+// The spec is parsed using the time zone of this Cron instance as the default.
+// The jobName is used for deduplication purposes, empty values are ignored
+// An opaque ID is returned that can be used to later remove it.
+func (c *Cron) AddJobWithName(spec, jobName string, cmd Job) (EntryID, error) {
 	schedule, err := c.parser.Parse(spec)
 	if err != nil {
-		return 0, err
+		return EntryID{}, err
 	}
-	return c.Schedule(schedule, cmd), nil
+	return c.Schedule(schedule, jobName, cmd), nil
 }
 
 // Schedule adds a Job to the Cron to be run on the given schedule.
 // The job is wrapped with the configured Chain.
-func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
+func (c *Cron) Schedule(schedule Schedule, jobName string, cmd Job) EntryID {
 	c.runningMu.Lock()
 	defer c.runningMu.Unlock()
-	c.nextID++
+
+	//empty job names supported for backward compatibility
+	if jobName != "" {
+		e := c.EntryByName(jobName)
+		if e != (Entry{}) {
+			return e.ID
+		}
+	}
+
 	entry := &Entry{
-		ID:         c.nextID,
+		ID:         c.NextID(jobName),
 		Schedule:   schedule,
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
@@ -175,14 +199,13 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 
 // Entries returns a snapshot of the cron entries.
 func (c *Cron) Entries() []Entry {
-	c.runningMu.Lock()
-	defer c.runningMu.Unlock()
 	if c.running {
 		replyChan := make(chan []Entry, 1)
 		c.snapshot <- replyChan
 		return <-replyChan
 	}
-	return c.entrySnapshot()
+	snap := c.entrySnapshot()
+	return snap
 }
 
 // Location gets the time zone location
@@ -194,6 +217,15 @@ func (c *Cron) Location() *time.Location {
 func (c *Cron) Entry(id EntryID) Entry {
 	for _, entry := range c.Entries() {
 		if id == entry.ID {
+			return entry
+		}
+	}
+	return Entry{}
+}
+
+func (c *Cron) EntryByName(name string) Entry {
+	for _, entry := range c.Entries() {
+		if name == entry.ID.Name {
 			return entry
 		}
 	}

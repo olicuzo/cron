@@ -279,9 +279,9 @@ func TestRunningMultipleSchedules(t *testing.T) {
 	cron.AddFunc("0 0 0 1 1 ?", func() {})
 	cron.AddFunc("0 0 0 31 12 ?", func() {})
 	cron.AddFunc("* * * * * ?", func() { wg.Done() })
-	cron.Schedule(Every(time.Minute), FuncJob(func() {}))
-	cron.Schedule(Every(time.Second), FuncJob(func() { wg.Done() }))
-	cron.Schedule(Every(time.Hour), FuncJob(func() {}))
+	cron.Schedule(Every(time.Minute), "", FuncJob(func() {}))
+	cron.Schedule(Every(time.Second), "", FuncJob(func() { wg.Done() }))
+	cron.Schedule(Every(time.Hour), "", FuncJob(func() {}))
 
 	cron.Start()
 	defer cron.Stop()
@@ -442,8 +442,8 @@ func TestJob(t *testing.T) {
 	cron.AddJob("0 0 0 1 1 ?", testJob{wg, "job1"})
 	job2, _ := cron.AddJob("* * * * * ?", testJob{wg, "job2"})
 	cron.AddJob("1 0 0 1 1 ?", testJob{wg, "job3"})
-	cron.Schedule(Every(5*time.Second+5*time.Nanosecond), testJob{wg, "job4"})
-	job5 := cron.Schedule(Every(5*time.Minute), testJob{wg, "job5"})
+	cron.Schedule(Every(5*time.Second+5*time.Nanosecond), "", testJob{wg, "job4"})
+	job5 := cron.Schedule(Every(5*time.Minute), "", testJob{wg, "job5"})
 
 	// Test getting an Entry pre-Start.
 	if actualName := cron.Entry(job2).Job.(testJob).name; actualName != "job2" {
@@ -501,8 +501,8 @@ func TestScheduleAfterRemoval(t *testing.T) {
 	var mu sync.Mutex
 
 	cron := newWithSeconds()
-	hourJob := cron.Schedule(Every(time.Hour), FuncJob(func() {}))
-	cron.Schedule(Every(time.Second), FuncJob(func() {
+	hourJob := cron.Schedule(Every(time.Hour), "", FuncJob(func() {}))
+	cron.Schedule(Every(time.Second), "", FuncJob(func() {
 		mu.Lock()
 		defer mu.Unlock()
 		switch calls {
@@ -541,12 +541,60 @@ func (*ZeroSchedule) Next(time.Time) time.Time {
 	return time.Time{}
 }
 
+func TestJobsWithSameNameAreDeduplicated(t *testing.T) {
+	cron := newWithSeconds()
+	var calls int64
+	cron.AddJobWithName("* * * * * *", "job_name", FuncJob(func() { atomic.AddInt64(&calls, 1) }))
+	cron.AddJobWithName("* * * * * *", "job_name", FuncJob(func() { atomic.AddInt64(&calls, 1) }))
+	cron.Start()
+	defer cron.Stop()
+	<-time.After(OneSecond)
+	if atomic.LoadInt64(&calls) != 1 {
+		t.Errorf("called %d times, expected 1\n", calls)
+	}
+
+	entries := cron.Entries()
+	if len(entries) != 1 {
+		t.Errorf("number of entries %d, expected 1\n", len(entries))
+	}
+
+	if entries[0].ID.Name != "job_name" {
+		t.Errorf("job name was %s, expected 'job_name'\n", entries[0].ID.Name)
+	}
+}
+
+func TestJobsWithEmptyNamesAreNotDeduplicated(t *testing.T) {
+	cron := newWithSeconds()
+	var calls int64
+	cron.AddJobWithName("* * * * * *", "", FuncJob(func() { atomic.AddInt64(&calls, 1) }))
+	cron.AddJobWithName("* * * * * *", "", FuncJob(func() { atomic.AddInt64(&calls, 1) }))
+	cron.Start()
+	defer cron.Stop()
+	<-time.After(OneSecond)
+	if atomic.LoadInt64(&calls) != 2 {
+		t.Errorf("called %d times, expected 2\n", calls)
+	}
+
+	entries := cron.Entries()
+	if len(entries) != 2 {
+		t.Errorf("number of entries %d, expected 2\n", len(entries))
+	}
+
+	if entries[0].ID.ID == 0 || entries[1].ID.ID == 0 {
+		t.Errorf("entry IDs should be positive numbers\n")
+	}
+
+	if entries[0].ID.ID == entries[1].ID.ID {
+		t.Errorf("entries should have different IDs\n")
+	}
+}
+
 // Tests that job without time does not run
 func TestJobWithZeroTimeDoesNotRun(t *testing.T) {
 	cron := newWithSeconds()
 	var calls int64
 	cron.AddFunc("* * * * * *", func() { atomic.AddInt64(&calls, 1) })
-	cron.Schedule(new(ZeroSchedule), FuncJob(func() { t.Error("expected zero task will not run") }))
+	cron.Schedule(new(ZeroSchedule), "", FuncJob(func() { t.Error("expected zero task will not run") }))
 	cron.Start()
 	defer cron.Stop()
 	<-time.After(OneSecond)
